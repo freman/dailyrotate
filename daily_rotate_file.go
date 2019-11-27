@@ -31,10 +31,14 @@ type File struct {
 	Location *time.Location
 
 	// info about currently opened file
-	day     int
-	path    string
-	file    *os.File
-	onClose func(path string, didRotate bool)
+	day  int
+	path string
+	file *os.File
+
+	noHooks     bool
+	onOpen      func(path string)
+	onClose     func(path string, didRotate bool)
+	beforeClose func(path string, willRotate bool)
 
 	// position in the file of last Write or Write2, exposed for tests
 	lastWritePos int64
@@ -44,9 +48,13 @@ func (f *File) close(didRotate bool) error {
 	if f.file == nil {
 		return nil
 	}
+	if !f.noHooks && f.beforeClose != nil {
+		f.beforeClose(f.path, didRotate)
+	}
+
 	err := f.file.Close()
 	f.file = nil
-	if err == nil && f.onClose != nil {
+	if err == nil && !f.noHooks && f.onClose != nil {
 		f.onClose(f.path, didRotate)
 	}
 	f.day = 0
@@ -83,6 +91,11 @@ func (f *File) open() error {
 		return err
 	}
 	_, err = f.file.Seek(0, io.SeekEnd)
+
+	if err == nil && !f.noHooks && f.onOpen != nil {
+		f.onOpen(f.path)
+	}
+
 	return err
 }
 
@@ -113,7 +126,11 @@ func (f *File) reopenIfNeeded() error {
 // time.Now().Format(`/logs/dir-2/2006-01-02.txt`) will change "-2" in "dir-2" to
 // current day. For better control over path generation, use NewFileWithPathGenerator
 func NewFile(pathFormat string, onClose func(path string, didRotate bool)) (*File, error) {
-	return newFile(pathFormat, nil, onClose)
+	opts := []option{WithPathFormat(pathFormat)}
+	if onClose != nil {
+		opts = append(opts, WithOnClose(onClose))
+	}
+	return New(opts...)
 }
 
 // NewFileWithPathGenerator creates a new file that will be rotated daily
@@ -127,7 +144,40 @@ func NewFile(pathFormat string, onClose func(path string, didRotate bool)) (*Fil
 // If onClose() takes a long time, you should do it in a background goroutine
 // (it blocks all other operations, including writes)
 func NewFileWithPathGenerator(pathGenerator func(time.Time) string, onClose func(path string, didRotate bool)) (*File, error) {
-	return newFile("", pathGenerator, onClose)
+	opts := []option{WithPathGenerator(pathGenerator)}
+	if onClose != nil {
+		opts = append(opts, WithOnClose(onClose))
+	}
+	return New(opts...)
+}
+
+// New is like the other new functions which are retained for compatability,
+// instead takes options
+func New(opts ...option) (*File, error) {
+	f := &File{
+		Location: time.UTC,
+	}
+
+	for _, opt := range opts {
+		opt(f)
+	}
+
+	// force early failure if we can't open the file
+	// note that we don't set onClose yet so that it won't get called due to
+	// opening/closing the file
+	f.noHooks = true
+	defer func() {
+		f.noHooks = false
+	}()
+	err := f.reopenIfNeeded()
+	if err != nil {
+		return nil, err
+	}
+	err = f.close(false)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 func newFile(pathFormat string, pathGenerator func(time.Time) string, onClose func(path string, didRotate bool)) (*File, error) {
